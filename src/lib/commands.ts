@@ -1,0 +1,64 @@
+import type { z } from "zod";
+import type { Role } from "@/lib/auth/roles";
+
+/*
+ * Shared by every module that writes: who acts, how a write is refused, and
+ * how form data becomes input for a zod schema.
+ */
+
+export interface Actor {
+  personId: string;
+  role: Role;
+}
+
+export type FieldErrors = Record<string, string>;
+
+/** A refused write. Forms show the message, or the field errors next to their fields (`refusalOf`). */
+export class CommandError extends Error {
+  constructor(
+    readonly code: "not_found" | "forbidden" | "invalid",
+    message: string,
+    readonly fieldErrors: FieldErrors = {},
+  ) {
+    super(message);
+    this.name = "CommandError";
+  }
+}
+
+/**
+ * What a form shows for a refused write: the field errors next to their
+ * fields, or else the message. Never both: a field error usually repeats the
+ * message, and the form would show it twice.
+ */
+export function refusalOf(error: CommandError): { fieldErrors: FieldErrors } | { formError: string } {
+  return Object.keys(error.fieldErrors).length > 0
+    ? { fieldErrors: error.fieldErrors }
+    : { formError: error.message };
+}
+
+/**
+ * Form fields as an object for zod. A field listed in `listFields`, or sent
+ * more than once, becomes an array; every other field is a string.
+ */
+export function formDataToObject(
+  formData: FormData,
+  listFields: readonly string[] = [],
+): Record<string, string | string[]> {
+  const result: Record<string, string | string[]> = {};
+  for (const key of new Set(formData.keys())) {
+    if (key.startsWith("$ACTION")) continue;
+    const values = formData.getAll(key).filter((value): value is string => typeof value === "string");
+    result[key] = listFields.includes(key) || values.length > 1 ? values : (values[0] ?? "");
+  }
+  return result;
+}
+
+/** The first message per field, keyed by the top-level field name. */
+export function fieldErrorsOf(error: z.ZodError): FieldErrors {
+  const errors: FieldErrors = {};
+  for (const issue of error.issues) {
+    const field = String(issue.path[0] ?? "form");
+    errors[field] ??= issue.message;
+  }
+  return errors;
+}
