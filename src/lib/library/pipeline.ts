@@ -1,0 +1,717 @@
+import path from "node:path";
+import { and, asc, desc, eq, inArray, isNotNull, lte, ne, or, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { recordAudit, type AuditAction } from "@/lib/audit";
+import type { Database, Transaction } from "@/lib/db/client";
+import {
+  auditEvent,
+  documentType,
+  note,
+  noteReason,
+  noteTag,
+  noteVersion,
+  person,
+  source,
+  sourceText,
+  submission,
+  tag,
+  tagProposal,
+  topicArea,
+} from "@/lib/db/schema";
+import { neverStopping, startPolling, type Stopping } from "@/lib/jobs/poll";
+import { logger } from "@/lib/logger";
+import { consumeRateLimit, RateLimitError } from "@/lib/rate-limit";
+import { originalKey, type Storage } from "@/lib/storage";
+import {
+  DUPLICATE_SUBMISSION_REASON,
+  noteRef,
+  notePath,
+  type ScreenFinding,
+  type SubmissionStatus,
+} from "./constants";
+import { creatingSubmitterOfSource, noteMayShowFileName } from "./access";
+import { draftNote, DraftError, DraftProviderError, type DraftModel, type NoteDraft } from "./draft";
+import {
+  ACCEPTED_TYPES,
+  detectFileType,
+  extractText,
+  ExtractionError,
+  type Extracted,
+  type OcrOptions,
+} from "./extract";
+import { fetchLink, LinkError } from "./fetch-link";
+import { findDoi, sha256Hex } from "./identify";
+import { notifyPerson, notifyMaintainers } from "./notify";
+import { storeOriginal } from "./originals";
+import { describeFindings, screenText } from "./screen";
+import { draftLists } from "./taxonomy";
+import { noteSearchText, snapshotOf } from "./note-text";
+import { safeSubmissionMessage, UPLOAD_PROCESSING_ERROR } from "./submissions";
+
+/*
+ * The worker's way for one upload, in a fixed order:
+ *
+ *   received → text extracted → screened → duplicate check → AI draft → note (draft)
+ *
+ * It stops early with a reason the uploader sees: quarantined (screen
+ * finding; a maintainer releases or deletes), duplicate (the source has a note),
+ * blocked (the source was discarded before), or parked (the text or the draft
+ * failed; a maintainer retries or deletes). Only the draft uses the AI model.
+ *
+ * A submission is claimed with FOR UPDATE SKIP LOCKED, so several workers
+ * never take the same one; the slow steps run outside any transaction.
+ */
+
+export interface PipelineDeps {
+  db: Database;
+  /** Null when storage is off: a file behind a link then keeps only its text. */
+  storage: Storage | null;
+  /**
+   * The AI model, or how to get the current one (the worker reads the `ai`
+   * setting each time). Null while none is set up: uploads wait.
+   */
+  model: DraftModel | (() => Promise<DraftModel | null>);
+  ocr: OcrOptions;
+  maxBytes: number;
+  /** Drafts per day across all uploads. */
+  dailyDraftLimit: number;
+  /** Tests only: allow links to loopback addresses. */
+  allowPrivateLinks?: boolean;
+}
+
+export type ProcessOutcome = Exclude<SubmissionStatus, "received" | "processing"> | "retry" | "waiting";
+
+/** A submission stuck in "processing" this long (the worker stopped) is taken up again. */
+const STALE_PROCESSING_MS = 30 * 60_000;
+/** What uploads say while no AI model is set up; the worker looks again after NO_MODEL_RETRY_MS. */
+export const WAITING_FOR_AI_MODEL =
+  "Waiting for an AI model: an admin sets one up under Admin › Integrations.";
+const NO_MODEL_RETRY_MS = 5 * 60_000;
+
+/** Waits after temporary errors (the AI model or a site cannot be reached). */
+const RETRY_DELAYS_MS = [5 * 60_000, 30 * 60_000];
+export const MAX_ATTEMPTS = RETRY_DELAYS_MS.length + 1;
+
+class Stop {
+  constructor(
+    readonly status: "quarantined" | "duplicate" | "blocked" | "parked",
+    readonly reason: string,
+    readonly extra: { noteId?: string; findings?: ScreenFinding[]; matchedSourceId?: string } = {},
+  ) {}
+}
+
+class Retry {
+  constructor(readonly reason: string) {}
+}
+
+/** Claims the next due submission, or returns null. */
+async function claimNext(db: Database, now: Date) {
+  return db.transaction(async (tx) => {
+    const [row] = await tx
+      .select()
+      .from(submission)
+      .where(
+        or(
+          and(eq(submission.status, "received"), lte(submission.nextAttemptAt, now)),
+          and(
+            eq(submission.status, "processing"),
+            lte(submission.statusChangedAt, new Date(now.getTime() - STALE_PROCESSING_MS)),
+          ),
+        ),
+      )
+      .orderBy(asc(submission.nextAttemptAt))
+      .limit(1)
+      .for("update", { skipLocked: true });
+    if (!row) return null;
+    await tx
+      .update(submission)
+      .set({ status: "processing", statusChangedAt: now, attempts: row.attempts + 1, updatedAt: now })
+      .where(eq(submission.id, row.id));
+    return { ...row, attempts: row.attempts + 1 };
+  });
+}
+
+type Claimed = NonNullable<Awaited<ReturnType<typeof claimNext>>>;
+type SourceRow = typeof source.$inferSelect;
+
+/** Downloads a link. A PDF behind a link is kept like an uploaded file. */
+async function textOfLink(
+  deps: PipelineDeps,
+  row: SourceRow,
+  claimed: Claimed,
+): Promise<{ extracted: Extracted; sourceId: string }> {
+  let fetched;
+  try {
+    fetched = await fetchLink(row.url!, {
+      maxBytes: deps.maxBytes,
+      allowPrivateAddresses: deps.allowPrivateLinks,
+    });
+  } catch (error) {
+    if (error instanceof LinkError) throw new Stop("parked", safeSubmissionMessage(error.message));
+    throw error;
+  }
+  const type = detectFileType(fetched.bytes, new URL(fetched.url).pathname, fetched.contentType);
+  // A web page or a text file: only its text is kept, read as for uploads.
+  if (type === "html" || type === "text")
+    return { extracted: await extractText(fetched.bytes, type, deps.ocr), sourceId: row.id };
+  if (type !== "pdf" && type !== "docx")
+    throw new Stop("parked", "The link leads to a file type the library cannot read.");
+
+  // A file behind a link: store it once, as for uploads. Without storage,
+  // only its text is kept, as for a web page.
+  const sha256 = sha256Hex(fetched.bytes);
+  const key = originalKey(sha256);
+  const storage = deps.storage;
+  const sourceId = !storage
+    ? row.id
+    : await deps.db.transaction(async (tx) => {
+        await storeOriginal(tx, storage, key, fetched.bytes, ACCEPTED_TYPES[type].mimeType);
+        const [match] = await tx
+          .select({ row: source, creatorId: creatingSubmitterOfSource(deps.db) })
+          .from(source)
+          .where(and(eq(source.sha256, sha256), ne(source.id, row.id)));
+        if (match) {
+          const { row: sameFile, creatorId } = match;
+          if (sameFile.kind === "link" && creatorId !== claimed.submitterId) {
+            // Matching bytes do not grant access to another uploader's saved URL.
+            await checkDuplicate(tx, sameFile.id, { rememberMatch: true });
+            throw new Stop("duplicate", DUPLICATE_SUBMISSION_REASON, { matchedSourceId: sameFile.id });
+          }
+          // Someone uploaded this file already: the upload belongs to that source.
+          await tx.update(submission).set({ sourceId: sameFile.id }).where(eq(submission.id, claimed.id));
+          // A source known without its original (e.g. imported) gets it now.
+          if (!sameFile.storageKey) {
+            await tx
+              .update(source)
+              .set({
+                storageKey: key,
+                sizeBytes: fetched.bytes.byteLength,
+                mimeType: ACCEPTED_TYPES[type].mimeType,
+                updatedAt: new Date(),
+              })
+              .where(eq(source.id, sameFile.id));
+          }
+          return sameFile.id;
+        }
+        // Name and type as for uploads, so a retry recognises the stored file.
+        const extension = ACCEPTED_TYPES[type].extensions[0]!;
+        const base = path.basename(new URL(fetched.url).pathname).slice(0, 150) || "link";
+        await tx
+          .update(source)
+          .set({
+            sha256,
+            storageKey: key,
+            sizeBytes: fetched.bytes.byteLength,
+            mimeType: ACCEPTED_TYPES[type].mimeType,
+            fileName: base.toLowerCase().endsWith(extension) ? base : `${base}${extension}`,
+            updatedAt: new Date(),
+          })
+          .where(eq(source.id, row.id));
+        return row.id;
+      });
+  try {
+    return { extracted: await extractText(fetched.bytes, type, deps.ocr), sourceId };
+  } catch (error) {
+    if (error instanceof ExtractionError) throw new Stop("parked", safeSubmissionMessage(error.message));
+    throw error;
+  }
+}
+
+/** A linked file can have moved its creating submission to the source of the same bytes. */
+async function mergedSourceOf(db: Database, row: SourceRow): Promise<string | undefined> {
+  const [moved] = await db
+    .select({ sourceId: submission.sourceId })
+    .from(auditEvent)
+    .innerJoin(submission, eq(submission.id, auditEvent.subjectId))
+    .innerJoin(source, eq(source.id, row.id))
+    .where(
+      and(
+        eq(auditEvent.subjectType, "submission"),
+        eq(auditEvent.action, "submission.received"),
+        eq(auditEvent.createdAt, source.createdAt),
+        sql`${auditEvent.payload}->>'sourceId' = ${row.id}`,
+        ne(submission.sourceId, row.id),
+      ),
+    )
+    .limit(1);
+  return moved?.sourceId;
+}
+
+/** A linked PDF can match an existing source before that source has a note. */
+async function recordedDuplicateSourceOf(db: Database, sourceId: string): Promise<string | undefined> {
+  const original = alias(source, "matched_source");
+  const [matched] = await db
+    .select({ sourceId: original.id })
+    .from(submission)
+    .leftJoin(note, eq(note.id, submission.noteId))
+    .leftJoin(
+      auditEvent,
+      and(
+        eq(auditEvent.subjectType, "submission"),
+        eq(auditEvent.subjectId, submission.id),
+        eq(auditEvent.action, "submission.duplicate"),
+      ),
+    )
+    // Preserve a recorded note even if the byte-matched source no longer exists.
+    .innerJoin(
+      original,
+      eq(original.id, sql`coalesce(${note.sourceId}, (${auditEvent.payload}->>'matchedSourceId')::uuid)`),
+    )
+    .where(and(eq(submission.sourceId, sourceId), eq(submission.status, "duplicate")))
+    .orderBy(desc(submission.statusChangedAt), desc(submission.id))
+    .limit(1);
+  return matched?.sourceId;
+}
+
+/** The source's text: stored from an earlier upload, or extracted now. */
+async function ensureText(deps: PipelineDeps, claimed: Claimed): Promise<{ text: string; sourceId: string }> {
+  const [result] = await deps.db
+    .select({ row: source, creatorId: creatingSubmitterOfSource(deps.db) })
+    .from(source)
+    .where(eq(source.id, claimed.sourceId));
+  if (!result) throw new Stop("parked", "The source no longer exists.");
+  const { row, creatorId } = result;
+  if (row.kind === "link" && creatorId !== claimed.submitterId) {
+    // A matching link is not proof the submitter can read the saved document.
+    await checkDuplicate(deps.db, row.id);
+    const matchedSourceId =
+      (await recordedDuplicateSourceOf(deps.db, row.id)) ??
+      (creatorId === null ? await mergedSourceOf(deps.db, row) : undefined);
+    if (matchedSourceId) await checkDuplicate(deps.db, matchedSourceId, { rememberMatch: true });
+    throw new Stop("duplicate", DUPLICATE_SUBMISSION_REASON, { matchedSourceId });
+  }
+  const [stored] = await deps.db
+    .select({ text: sourceText.text })
+    .from(sourceText)
+    .where(eq(sourceText.sourceId, row.id));
+  if (stored) return { text: stored.text, sourceId: row.id };
+
+  let extracted: Extracted;
+  let sourceId = row.id;
+  if (row.kind === "link" && !row.storageKey) {
+    ({ extracted, sourceId } = await textOfLink(deps, row, claimed));
+    if (sourceId !== row.id) {
+      const [existingText] = await deps.db
+        .select({ text: sourceText.text })
+        .from(sourceText)
+        .where(eq(sourceText.sourceId, sourceId));
+      if (existingText) return { text: existingText.text, sourceId };
+    }
+  } else {
+    if (!deps.storage)
+      throw new Stop("parked", "Storage is off, so the library cannot read the original file.");
+    const bytes = row.storageKey ? await deps.storage.get(row.storageKey) : null;
+    if (!bytes) throw new Stop("parked", "The original file is missing from storage.");
+    const type = detectFileType(bytes, row.fileName ?? "", row.mimeType ?? "");
+    if (!type) throw new Stop("parked", "The library cannot read this file type.");
+    try {
+      extracted = await extractText(bytes, type, deps.ocr);
+    } catch (error) {
+      if (error instanceof ExtractionError) throw new Stop("parked", safeSubmissionMessage(error.message));
+      throw error;
+    }
+  }
+  if (extracted.text.replace(/\s+/g, "").length < 50)
+    throw new Stop("parked", "The source has almost no readable text.");
+  await deps.db.transaction(async (tx) => {
+    await tx.insert(sourceText).values({ sourceId, text: extracted.text }).onConflictDoNothing();
+    const [current] = await tx
+      .select({ url: source.url, normalizedUrl: source.normalizedUrl })
+      .from(source)
+      .where(eq(source.id, sourceId));
+    await tx
+      .update(source)
+      .set({
+        extractionMethod: extracted.method,
+        extractedAt: new Date(),
+        textChars: extracted.text.length,
+        detectedTitle: extracted.title?.slice(0, 300) ?? null,
+        doi: findDoi(extracted.text) ?? (current?.url ? findDoi(current.url) : null),
+        updatedAt: new Date(),
+      })
+      .where(eq(source.id, sourceId));
+  });
+  return { text: extracted.text, sourceId };
+}
+
+/** The note of this source, or of another source with the same DOI. */
+async function existingNoteFor(db: Database | Transaction, sourceId: string) {
+  const [own] = await db
+    .select({ id: note.id, status: note.status })
+    .from(note)
+    .where(eq(note.sourceId, sourceId));
+  if (own) return own;
+  const [row] = await db.select({ doi: source.doi }).from(source).where(eq(source.id, sourceId));
+  if (!row?.doi) return undefined;
+  const [byDoi] = await db
+    .select({ id: note.id, status: note.status })
+    .from(note)
+    .innerJoin(source, eq(source.id, note.sourceId))
+    .where(and(eq(source.doi, row.doi), ne(source.id, sourceId)))
+    .limit(1);
+  return byDoi;
+}
+
+async function checkDuplicate(
+  db: Database | Transaction,
+  sourceId: string,
+  { rememberMatch = false } = {},
+): Promise<void> {
+  const [row] = await db.select({ blockedAt: source.blockedAt }).from(source).where(eq(source.id, sourceId));
+  if (row?.blockedAt)
+    throw new Stop("blocked", "This source was discarded before, so the library does not draft it again.");
+  const existing = await existingNoteFor(db, sourceId);
+  if (!existing) return;
+  if (existing.status === "discarded")
+    throw new Stop("blocked", "This source was discarded before, so the library does not draft it again.");
+  throw new Stop("duplicate", DUPLICATE_SUBMISSION_REASON, {
+    noteId: existing.id,
+    matchedSourceId: rememberMatch ? sourceId : undefined,
+  });
+}
+
+async function createNote(
+  deps: PipelineDeps,
+  claimed: Claimed,
+  sourceId: string,
+  draft: NoteDraft,
+  now: Date,
+  model: DraftModel,
+) {
+  return deps.db.transaction(async (tx) => {
+    // The same source, or one with the same DOI, may have been drafted from
+    // another upload meanwhile: check again, serialized per DOI.
+    const [identity] = await tx.select({ doi: source.doi }).from(source).where(eq(source.id, sourceId));
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtext(${identity?.doi ? `doi:${identity.doi}` : `source:${sourceId}`}))`,
+    );
+    await checkDuplicate(tx, sourceId);
+    const [owner] = await tx
+      .select({ teamId: person.teamId })
+      .from(person)
+      .where(eq(person.id, claimed.submitterId));
+    const [type] = draft.documentType
+      ? await tx
+          .select({ id: documentType.id })
+          .from(documentType)
+          .where(eq(documentType.name, draft.documentType))
+      : [];
+    const [area] = draft.topicArea
+      ? await tx.select({ id: topicArea.id }).from(topicArea).where(eq(topicArea.name, draft.topicArea))
+      : [];
+    const tags =
+      draft.tags.length > 0
+        ? await tx.select({ id: tag.id, name: tag.name }).from(tag).where(inArray(tag.name, draft.tags))
+        : [];
+    // Without a team, "My team" would hide the note from everyone but its owner.
+    const visibility = draft.visibility === "team" && !owner?.teamId ? "all" : draft.visibility;
+    const values = {
+      sourceId,
+      ownerId: claimed.submitterId,
+      teamId: owner?.teamId ?? null,
+      visibility,
+      status: "draft" as const,
+      title: draft.title,
+      core: draft.core,
+      keyPoints: draft.keyPoints,
+      quotes: draft.quotes,
+      citation: draft.citation,
+      language: draft.language,
+      documentTypeId: type?.id ?? null,
+      topicAreaId: area?.id ?? null,
+      uncertainFields: draft.uncertainFields,
+      draftModel: model.name,
+      draftedAt: now,
+      searchText: noteSearchText({
+        keyPoints: draft.keyPoints,
+        quotes: draft.quotes,
+        citation: draft.citation,
+        tagNames: tags.map((t) => t.name),
+      }),
+    };
+    const [created] = await tx.insert(note).values(values).returning({ id: note.id, number: note.number });
+    if (tags.length > 0)
+      await tx.insert(noteTag).values(tags.map((t) => ({ noteId: created!.id, tagId: t.id })));
+    for (const name of draft.proposedTags) await tx.insert(tagProposal).values({ name, noteId: created!.id });
+    if (claimed.reason)
+      await tx
+        .insert(noteReason)
+        .values({ noteId: created!.id, personId: claimed.submitterId, reason: claimed.reason });
+    await tx.insert(noteVersion).values({
+      noteId: created!.id,
+      version: 1,
+      snapshot: snapshotOf({ ...values, tagNames: tags.map((t) => t.name) }),
+      editorId: null,
+    });
+    await tx
+      .update(submission)
+      .set({
+        status: "drafted",
+        statusChangedAt: now,
+        statusReason: null,
+        noteId: created!.id,
+        updatedAt: now,
+      })
+      .where(eq(submission.id, claimed.id));
+    await recordAudit(tx, {
+      actorId: null,
+      action: "note.drafted",
+      subjectType: "note",
+      subjectId: created!.id,
+      payload: {
+        number: created!.number,
+        submissionId: claimed.id,
+        model: model.name,
+        uncertain: draft.uncertainFields,
+      },
+    });
+    await notifyPerson(tx, {
+      event: "draft_ready",
+      subjectKey: created!.id,
+      recipientId: claimed.submitterId,
+      channel: "slack",
+      noteId: created!.id,
+      message: {
+        subject: `Review your draft: ${noteRef(created!.number)} ${draft.title}`,
+        title: `${noteRef(created!.number)} · ${draft.title}`,
+        text: "The AI draft of your upload is ready. Check it against the original, correct it, and publish it.",
+        path: notePath(created!.number),
+      },
+    });
+    return created!;
+  });
+}
+
+const STOP_MESSAGES: Record<
+  Stop["status"],
+  { subject: string; text: (reason: string) => string; maintainers: boolean }
+> = {
+  quarantined: {
+    subject: "Your upload is on hold",
+    text: (reason) => `${reason} A maintainer checks it and releases or deletes it.`,
+    maintainers: true,
+  },
+  duplicate: { subject: "The library has your upload already", text: (reason) => reason, maintainers: false },
+  blocked: { subject: "Your upload was not drafted", text: (reason) => reason, maintainers: false },
+  parked: {
+    subject: "Your upload could not be drafted",
+    text: (reason) => `${reason} A maintainer will look at it.`,
+    maintainers: true,
+  },
+};
+
+async function stop(deps: PipelineDeps, claimed: Claimed, result: Stop, now: Date): Promise<ProcessOutcome> {
+  await deps.db.transaction(async (tx) => {
+    await tx
+      .update(submission)
+      .set({
+        status: result.status,
+        statusChangedAt: now,
+        statusReason: result.reason,
+        screenFindings: result.extra.findings ?? [],
+        noteId: result.extra.noteId ?? null,
+        updatedAt: now,
+      })
+      .where(eq(submission.id, claimed.id));
+    if (result.status === "duplicate" && result.extra.noteId && claimed.reason) {
+      const [already] = await tx
+        .select({ id: noteReason.id })
+        .from(noteReason)
+        .where(and(eq(noteReason.noteId, result.extra.noteId), eq(noteReason.personId, claimed.submitterId)));
+      if (!already) {
+        await tx
+          .insert(noteReason)
+          .values({ noteId: result.extra.noteId, personId: claimed.submitterId, reason: claimed.reason });
+        await recordAudit(tx, {
+          actorId: claimed.submitterId,
+          action: "note.reason_added",
+          subjectType: "note",
+          subjectId: result.extra.noteId,
+        });
+      }
+    }
+    await recordAudit(tx, {
+      actorId: null,
+      action: `submission.${result.status}` satisfies AuditAction,
+      subjectType: "submission",
+      subjectId: claimed.id,
+      payload: {
+        reason: result.reason,
+        rules: result.extra.findings?.map((finding) => finding.rule),
+        matchedSourceId: result.extra.matchedSourceId,
+      },
+    });
+    const copy = STOP_MESSAGES[result.status];
+    const message = {
+      subject: copy.subject,
+      title: copy.subject,
+      text: copy.text(result.reason),
+      path: "/uploads",
+    };
+    await notifyPerson(tx, {
+      event: result.status,
+      subjectKey: claimed.id,
+      recipientId: claimed.submitterId,
+      channel: "slack",
+      message,
+    });
+    if (copy.maintainers) {
+      await notifyMaintainers(tx, {
+        event: result.status,
+        subjectKey: `${claimed.id}:maintainers`,
+        channel: "email",
+        message: {
+          ...message,
+          subject: `Maintenance: an upload is ${result.status}`,
+          text: `${result.reason}`,
+          path: "/maintenance",
+        },
+      });
+    }
+  });
+  return result.status;
+}
+
+/** Processes the next due submission. Returns null when none is due. */
+export async function processNext(
+  deps: PipelineDeps,
+  now: Date = new Date(),
+): Promise<ProcessOutcome | null> {
+  const claimed = await claimNext(deps.db, now);
+  if (!claimed) return null;
+  const log = logger.child({ submissionId: claimed.id, attempt: claimed.attempts });
+  try {
+    const { text, sourceId } = await ensureText(deps, claimed);
+    if (!claimed.releasedAt) {
+      const findings = screenText(text);
+      if (findings.length > 0) throw new Stop("quarantined", describeFindings(findings), { findings });
+    }
+    await checkDuplicate(deps.db, sourceId);
+
+    const model = typeof deps.model === "function" ? await deps.model() : deps.model;
+    if (!model) {
+      // Nothing to draft with yet: wait, without counting an attempt or using the budget.
+      await deps.db
+        .update(submission)
+        .set({
+          status: "received",
+          statusChangedAt: now,
+          statusReason: WAITING_FOR_AI_MODEL,
+          attempts: claimed.attempts - 1,
+          nextAttemptAt: new Date(now.getTime() + NO_MODEL_RETRY_MS),
+        })
+        .where(eq(submission.id, claimed.id));
+      log.info("no AI model is set up; the upload waits");
+      return "waiting";
+    }
+
+    try {
+      await consumeRateLimit(
+        deps.db,
+        "ai-draft",
+        { limit: deps.dailyDraftLimit, windowSeconds: 86_400 },
+        now,
+      );
+    } catch (error) {
+      if (!(error instanceof RateLimitError)) throw error;
+      // The budget is used up: wait for the next day, without counting an attempt.
+      const tomorrow = new Date(Math.floor(now.getTime() / 86_400_000 + 1) * 86_400_000);
+      await deps.db
+        .update(submission)
+        .set({
+          status: "received",
+          statusChangedAt: now,
+          statusReason: "Waiting for the next day's AI budget.",
+          attempts: claimed.attempts - 1,
+          nextAttemptAt: tomorrow,
+        })
+        .where(eq(submission.id, claimed.id));
+      log.info("AI draft budget used up for today");
+      return "waiting";
+    }
+
+    const [sourceForDraft] = await deps.db
+      .select({ row: source, creatorId: creatingSubmitterOfSource(deps.db) })
+      .from(source)
+      .where(eq(source.id, sourceId));
+    const row = sourceForDraft?.row;
+    const lists = await draftLists(deps.db);
+    let draft: NoteDraft;
+    try {
+      draft = await draftNote(model, {
+        text,
+        detectedTitle: row?.detectedTitle ?? undefined,
+        // The note will be the submitter's.
+        fileName: noteMayShowFileName({ ownerId: claimed.submitterId }, sourceForDraft?.creatorId ?? null)
+          ? (row?.fileName ?? undefined)
+          : undefined,
+        url: row?.url ?? undefined,
+        reason: claimed.reason,
+        ...lists,
+      });
+    } catch (error) {
+      if (error instanceof DraftError) throw new Stop("parked", `The AI draft failed: ${error.message}`);
+      throw new Retry(
+        error instanceof DraftProviderError ? error.message : "The AI draft could not be completed.",
+      );
+    }
+    await createNote(deps, claimed, sourceId, draft, now, model);
+    log.info("note drafted");
+    return "drafted";
+  } catch (error) {
+    if (error instanceof Stop) {
+      log.info({ status: error.status }, "submission stopped");
+      return stop(deps, claimed, error, now);
+    }
+    const reason = error instanceof Retry ? error.reason : UPLOAD_PROCESSING_ERROR;
+    if (claimed.attempts >= MAX_ATTEMPTS) {
+      log.error({ error: reason }, "submission parked after repeated errors");
+      return stop(deps, claimed, new Stop("parked", reason.slice(0, 500)), now);
+    }
+    const delay = RETRY_DELAYS_MS[claimed.attempts - 1] ?? RETRY_DELAYS_MS.at(-1)!;
+    await deps.db
+      .update(submission)
+      .set({
+        status: "received",
+        statusChangedAt: now,
+        statusReason: reason.slice(0, 500),
+        nextAttemptAt: new Date(now.getTime() + delay),
+      })
+      .where(eq(submission.id, claimed.id));
+    log.warn({ error: reason }, "submission will be retried");
+    return "retry";
+  }
+}
+
+/**
+ * Processes due submissions until none is left or `limit` is reached. Once
+ * `stopping` says so, it finishes the submission at hand and claims no other.
+ */
+export async function processDue(
+  deps: PipelineDeps,
+  limit = 20,
+  stopping: Stopping = neverStopping,
+): Promise<Partial<Record<ProcessOutcome, number>>> {
+  const counts: Partial<Record<ProcessOutcome, number>> = {};
+  for (let i = 0; i < limit && !stopping(); i += 1) {
+    const outcome = await processNext(deps);
+    if (!outcome) break;
+    counts[outcome] = (counts[outcome] ?? 0) + 1;
+    if (outcome === "waiting") break;
+  }
+  return counts;
+}
+
+/** Polls for due submissions every `intervalMs`. Returns a function that stops and waits for the current run. */
+export function startProcessor(deps: PipelineDeps, intervalMs: number): () => Promise<void> {
+  return startPolling("processing", (stopping) => processDue(deps, 20, stopping), intervalMs);
+}
+
+/** Uploads that are not finished, for the maintenance page and the admin page. */
+export async function openProblemCount(db: Database): Promise<number> {
+  const [row] = await db
+    .select({ value: sql<number>`count(*)::int` })
+    .from(submission)
+    .where(and(inArray(submission.status, ["quarantined", "parked"]), isNotNull(submission.id)));
+  return row?.value ?? 0;
+}

@@ -1,0 +1,224 @@
+import { eq, sql } from "drizzle-orm";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { notificationDelivery, person } from "@/lib/db/schema";
+import { emailToAddress, notifyPerson, postToChannel } from "@/lib/library/notify";
+import { connectTestDatabase } from "../../../tests/integration/db";
+import { seedDirectory } from "../../../tests/integration/seed";
+import { dispatchDue } from "./dispatch";
+import type { Email, Transports } from "./transports";
+import type { NotificationMessage } from "./types";
+
+const testDb = connectTestDatabase();
+const db = testDb.db;
+let seed: Awaited<ReturnType<typeof seedDirectory>>;
+let sent: Email[];
+let slackPosts: { to: string; text: string }[];
+
+const transports = (options: { email?: boolean } = {}): Transports => ({
+  baseUrl: "https://library.example",
+  email:
+    options.email === false
+      ? undefined
+      : { mode: "live", kind: "test", send: async (email) => void sent.push(email) },
+  slack: {
+    mode: "live",
+    lookupUserByEmail: async () => "U0ADA",
+    postMessage: async (to, text) => void slackPosts.push({ to, text }),
+  },
+});
+
+const DIGEST: NotificationMessage = {
+  subject: "Library digest: 1 new note",
+  title: "Weekly library digest",
+  text: "1 new note was published in the library in the last 7 days.",
+  path: "/",
+  sections: [
+    {
+      heading: "Climate",
+      items: [{ ref: "LIB-1", title: "Heat", path: "/n/1", summary: "Cities heat up." }],
+    },
+  ],
+  footer: "The library sends this digest every Monday to all-staff@example.org.",
+};
+
+afterAll(() => testDb.close());
+beforeEach(async () => {
+  await testDb.reset();
+  seed = await seedDirectory(db);
+  sent = [];
+  slackPosts = [];
+});
+
+describe("dispatch to an email address", () => {
+  it("sends the email to the address, greeting nobody by name", async () => {
+    expect(
+      await emailToAddress(db, {
+        event: "weekly_digest",
+        key: "2026-W47:all",
+        address: "all-staff@example.org",
+        message: DIGEST,
+      }),
+    ).toBe(true);
+    expect(
+      await emailToAddress(db, {
+        event: "weekly_digest",
+        key: "2026-W47:all",
+        address: "all-staff@example.org",
+        message: DIGEST,
+      }),
+    ).toBe(false);
+    expect(await dispatchDue(db, transports())).toEqual({ sent: 1, skipped: 0, retry: 0, failed: 0 });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ to: "all-staff@example.org", subject: "Library digest: 1 new note" });
+    expect(sent[0]!.toName).toBeUndefined();
+    expect(sent[0]!.text.split("\n")[0]).toBe("Hello,");
+    expect(sent[0]!.text).toContain("- LIB-1 · Heat: Cities heat up.\n  https://library.example/n/1");
+    expect(sent[0]!.text).toContain("every Monday to all-staff@example.org");
+    expect(slackPosts).toHaveLength(0);
+    const [row] = await db.select().from(notificationDelivery);
+    expect(row).toMatchObject({
+      status: "sent",
+      channel: "email_address",
+      channelId: "all-staff@example.org",
+      recipientId: null,
+    });
+  });
+
+  it("skips it while email is off, and never posts it to Slack instead", async () => {
+    await emailToAddress(db, {
+      event: "weekly_digest",
+      key: "2026-W47:all",
+      address: "all-staff@example.org",
+      message: DIGEST,
+    });
+    expect(await dispatchDue(db, transports({ email: false }))).toEqual({
+      sent: 0,
+      skipped: 1,
+      retry: 0,
+      failed: 0,
+    });
+    expect(slackPosts).toHaveLength(0);
+    expect((await db.select().from(notificationDelivery))[0]).toMatchObject({
+      status: "skipped",
+      lastError: "Email is not configured.",
+    });
+  });
+
+  it("stamps every delivery with the app's clock, so it is due at once", async () => {
+    await notifyPerson(db, {
+      event: "intake_reply",
+      subjectKey: "email:y",
+      recipientId: seed.people.ada.id,
+      channel: "email",
+      message: DIGEST,
+    });
+    await postToChannel(db, {
+      event: "weekly_digest",
+      key: "2026-W47:all",
+      channelId: "C0123456789",
+      message: DIGEST,
+    });
+    await emailToAddress(db, {
+      event: "weekly_digest",
+      key: "2026-W47:all",
+      address: "all-staff@example.org",
+      message: DIGEST,
+    });
+    // A database default would have microseconds; a JavaScript date never has.
+    const rows = await db.execute<{ micros: number }>(
+      sql`select (extract(microseconds from next_attempt_at)::bigint % 1000)::int as micros from notification_delivery`,
+    );
+    expect(rows.rows.map((row) => row.micros)).toEqual([0, 0, 0]);
+  });
+
+  it("still sends messages to people by name", async () => {
+    await db.update(person).set({ workEmail: "ada@example.org" }).where(eq(person.id, seed.people.ada.id));
+    await notifyPerson(db, {
+      event: "intake_reply",
+      subjectKey: "email:x",
+      recipientId: seed.people.ada.id,
+      channel: "email",
+      message: { ...DIGEST, sections: undefined },
+    });
+    await dispatchDue(db, transports());
+    expect(sent[0]).toMatchObject({ to: "ada@example.org", toName: "Ada Author" });
+    expect(sent[0]!.text.split("\n")[0]).toBe("Hello Ada Author,");
+  });
+
+  it("scrubs raw errors from parked-upload messages queued by an older worker", async () => {
+    await db.update(person).set({ slackUserId: "U0ADA" }).where(eq(person.id, seed.people.ada.id));
+    await notifyPerson(db, {
+      event: "parked",
+      subjectKey: "upload",
+      recipientId: seed.people.ada.id,
+      channel: "slack",
+      message: {
+        subject: "Your upload could not be drafted",
+        title: "Your upload could not be drafted",
+        text: "The AI model could not be reached: private provider detail. A maintainer will look at it.",
+        path: "/uploads",
+      },
+    });
+    expect(await dispatchDue(db, transports())).toMatchObject({ sent: 1 });
+    expect(slackPosts[0]?.text).toContain("The AI draft could not be completed.");
+    expect(slackPosts[0]?.text).not.toContain("private provider detail");
+  });
+
+  it("sends a generic update for duplicate uploads queued by an older worker", async () => {
+    await db.update(person).set({ slackUserId: "U0ADA" }).where(eq(person.id, seed.people.ada.id));
+    await notifyPerson(db, {
+      event: "duplicate",
+      subjectKey: "upload",
+      recipientId: seed.people.ada.id,
+      channel: "slack",
+      message: {
+        subject: "The library has your upload already",
+        title: "The library has your upload already",
+        text: "The library has this source already: LIB-12. Your reason was added to the note.",
+        path: "/uploads",
+      },
+    });
+    expect(await dispatchDue(db, transports())).toMatchObject({ sent: 1 });
+    expect(slackPosts[0]?.text).toContain("The library has this source already.");
+    expect(slackPosts[0]?.text).not.toContain("LIB-12");
+  });
+});
+
+describe("dispatch during a stop", () => {
+  it("finishes the message it is sending, records it, and leaves the rest for the next worker", async () => {
+    for (const key of ["2026-W47:a", "2026-W47:b", "2026-W47:c"]) {
+      await emailToAddress(db, {
+        event: "weekly_digest",
+        key,
+        address: `${key.slice(-1)}@example.org`,
+        message: DIGEST,
+      });
+    }
+    // The stop comes while the first email is on its way.
+    let stopping = false;
+    const slow = transports();
+    const send = slow.email!.send;
+    slow.email = {
+      ...slow.email!,
+      send: async (email) => {
+        stopping = true;
+        await send(email);
+      },
+    };
+    expect(await dispatchDue(db, slow, undefined, undefined, () => stopping)).toEqual({
+      sent: 1,
+      skipped: 0,
+      retry: 0,
+      failed: 0,
+    });
+    const rows = await db
+      .select({ status: notificationDelivery.status, attempts: notificationDelivery.attempts })
+      .from(notificationDelivery);
+    expect(rows.map((row) => row.status).sort()).toEqual(["pending", "pending", "sent"]);
+    expect(rows.filter((row) => row.status === "pending").every((row) => row.attempts === 0)).toBe(true);
+
+    // The worker after the restart sends the other two, and the first one not again.
+    expect(await dispatchDue(db, transports())).toEqual({ sent: 2, skipped: 0, retry: 0, failed: 0 });
+    expect(sent.map((email) => email.to).sort()).toEqual(["a@example.org", "b@example.org", "c@example.org"]);
+  });
+});

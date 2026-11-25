@@ -1,0 +1,19 @@
+# Gitleaks (the CI job "Secrets in the history"): its default rules, without
+# the invented values of this repository. Each is an example or test value,
+# never valid where the app is in use (config.ts refuses the example secret).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Example and test values"
+regexes = [
+  # A key the screen must hold back (src/lib/library/screen.test.ts).
+  '''^sk-1234567890abcdef$''',
+  # Settings in the tests (src/lib/settings/*.test.ts).
+  '''^mlsn\.0123456789abcdef$''',
+  '''^0123456789abcdef$''',
+  '''^signing-secret-0123456789abcdef$''',
+  '''^mistral-key-0123456789$''',
+  # Slack's example signing secret in its documentation (src/lib/slack/signature.test.ts).
+  '''^8f742231b10e8888abcd99yyyzzz85a5$''',
+]
